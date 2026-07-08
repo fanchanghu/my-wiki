@@ -1,0 +1,166 @@
+---
+title: 'Neural ODE 与伴随灵敏度方法（Adjoint Sensitivity Method）'
+date: 2025-08-14
+permalink: /posts/2025/08/neural-ode/
+tags:
+  - Neural ODE
+  - 伴随灵敏度方法
+  - Adjoint Sensitivity Method
+  - ODE
+---
+
+Neural ODE 是 NIPS 2018 最佳论文，通过对残差网络数学形式进行推广，把残差网络中的离散层更新看成 ODE 的欧拉离散，进而直接用 ODE 求解器把“层深”变成“时间”，实现恒定内存、自适应步长、可逆、可端到端训练的连续深度网络。本文以 Neural ODE 为背景，介绍其中求解梯度的方法：**伴随灵敏度方法**。
+
+论文：[Neural Ordinary Differential Equations](https://arxiv.org/abs/1806.07366v5)
+
+## 从残差网络出发
+
+我们知道，在残差网络中，每个残差块可以用如下公式描述：
+
+$$
+z(t+1)=z(t)+f_{\theta_t}(z(t)) \tag{1}
+$$
+
+其中， `t` 表示层的序号， `z(0) = x` 为输入层， `z(T) = y` 为输出层（假设 `T` 为总层数）。
+
+公式（1）也可以写为如下形式：
+
+$$
+\frac{z(t+1)-z(t)}{(t+1)-t}=f_{\theta_t}(z(t)) \tag{2}
+$$
+
+可以看到，这与 `z(t)` 的微分方程形式一致：在 `t` 时刻，取 `dt = 1` 。
+
+## Neural ODE
+
+Neural ODE 正是从这一观察出发，将 `t` 假设为连续“时间”变量，若 `z ∈ R^D` ， `f` 看作 `R^D` 上的向量场，`z(t)` 成为 `R^D` 上的一条从 `0` 时刻出发、在向量场 `f` 作用下的运动轨迹。`z(0), z(1), z(2), ..., z(T)` 可以视为轨迹在 `t=1, 2, ..., T` 时刻的位置。
+
+基于以上连续性假设，我们可以将公式（2）重述为如下形式：
+
+$$
+\frac{dz}{dt}=f(z(t), t, \theta) \tag{3}
+$$
+
+这里，函数 `f(z(t), t, θ)` 通常使用一个神经网络模拟，我们定义网络参数 `θ` 在所有时间上共享。注意 `f(z(t), t, θ)` 并非 ODE 要模拟的神经网络，它只相当于后者的残差块中计算“残差”的部分。
+
+我们设 `t_0` 为起始时刻，`t_1` 为结束时刻，则 `z(t_0) = x` 为输入， `z(t_1) = y` 为输出，整个网络的前向过程相当于 `x` 在向量场 `f` 的作用下，运动到 `y` 的轨迹。即：
+
+$$
+z(t_1)=z(t_0)+\int_{t_0}^{t_1} f(z(t), t, \theta) dt \tag{4}
+$$
+
+基于以上分析，我们可以给出Neural ODE的数学模型：
+
+- **前向过程**：给定输入 `z(t_0) = x` ，通过公式（4）把轨迹算到 `t_1` ，得到 `z(t_1)` 。
+- **损失函数**：定义损失函数为：`L(z(t_1))`（例如交叉熵、MSE）。
+- **反向过程**：求出 `dL/dθ` ，然后使用梯度下降算法，更新网络 `f` 的权重 `θ` 。
+
+这里，前向过程的 `z(t_1)` 可以直接用**ODE-Solver**来求解，反向过程的梯度 `dL/dθ` 则需要使用**伴随灵敏度方法**求解，下面我们将分别介绍。
+
+## ODE-Solver
+
+公式（4）的一个问题是——如何计算积分：\\( \int_{t_0}^{t_1} f(z(t), t, \theta) dt \\) ？由于\\( f \\)的复杂性，该积分通常没有解析解。不过，人类研究ODE已经有上百年的历史，已经有多种关于上述形式的ODE的数值解法。下面我们以牛顿法为例，介绍一下ODE-Solver。
+
+牛顿法其实就是按照积分的定义，将积分区间分为许多小段，然后用所有段的“面积”之和近似积分值。对区间分的越小，近似精度越高。
+
+在 Neural ODE 前向过程中，如果 `[t_0,t_1]` 等分为 `n` 份，每份长度为 `ε = (t_1 - t_0)/n` ，则我们可以通过以下公式，从 `z(t_0)` 开始，迭代计算出 `z(t_1)` 的值：
+
+$$
+z(t_0+i\epsilon) \approx z(t_0+(i-1)\epsilon) + \epsilon f(z(t_0+(i-1)\epsilon), t_0+(i-1)\epsilon, \theta), i \in [1,n] \tag{5}
+$$
+
+观察公式（5）的计算过程不难发现，每次计算类似一次残差运算，`n` 相当于残差网络的层数。
+
+一般地，我们定义 ODE-Solver 为黑盒形式的微分方程求解器:
+
+$$
+z(t_1) = ODESolver(z(t_0), f(z, t, \theta), t_0, t_1, \theta)  \tag{6}
+$$
+
+使用它就能返回积分终点 `z(t_1)` 的近似解，使用者无需关心其内部到底用了哪种算法、如何选步长、如何做误差控制。其主要参数如下：
+
+- 微分方程右侧函数 `f(z(t), t, θ)` ，
+- 初值 `z(t_0)`
+- 起止时间 `t_0, t_1`
+
+## 伴随灵敏度方法（Adjoint Sensitivity Method）
+
+为了计算梯度 `dL/dθ` ，首先需要引入伴随状态 `a(t) = ∂L/∂z(t)` ，该状态由一个类似公式（3）的 ODE 给出，但其初始值在 `t_1` 时刻，可以通过 ODE Solver 从 `t_1` 到 `t_0` 进行计算，如下图所示：
+
+![Illustration Adjoint Sensitivity Method](/images/202508/neural-ode-1.png)
+
+
+然后， `dL/dθ` 也可以用一个包含 `a(t)` 的 ODE 给出，也可以通过从 `t_1` 到 `t_0` 的 ODE Solver 求解。
+
+### 伴随状态
+
+计算伴随状态 `a(t)` 需要利用一个技巧，我们可以将其视为**连续版本的链式法则**，如下：
+
+$$
+\begin{align*}
+a(t) &= \frac{\partial \mathbb{L}}{\partial z(t)} \\
+     &= \frac{\partial \mathbb{L}}{\partial z(t+dt)} \frac{\partial z(t+dt)}{\partial z(t)} \\
+     &= a(t+dt) \frac{\partial (z(t)+fdt+o(dt))}{\partial z(t)} \\
+     &= a(t+dt) + a(t+dt) \frac{\partial f}{\partial z(t)}dt + o(dt) \tag{7}
+\end{align*}
+$$
+
+这是利用了 \\( z(t+dt)= z(t)+fdt+o(dt) \\) （根据微分定义或泰勒展开）。
+
+利用上式，计算 `a(t)` 的梯度：
+
+$$
+\begin{align*}
+\frac{da(t)}{dt} &= \lim_{dt \to 0} \frac{a(t+dt) - a(t)}{dt} \\
+                 &= \lim_{dt \to 0} \frac{-a(t+dt) \frac{\partial f}{\partial z(t)}dt - o(dt)}{dt} \\
+                 &= -a(t) \frac{\partial f}{\partial z(t)} \tag{8}
+\end{align*}
+$$
+
+这样，我们就可以通过 ODE-Solver 来求解任意时刻 `a(t)` 的值：
+- 微分方程右侧函数：由公式（8）给出
+- 初值 \\( a(t_1) = \frac{\partial \mathbb{L}}{\partial a(t_1)} \\) ，这实际是损失函数关于最终隐藏状态的梯度
+- 起止时间 `t_1, t_0`
+
+注意到，这里是从 `t_1` 到 `t_0` 反向求解的过程。
+
+### 梯度 `dL/dθ`
+
+为了计算梯度 `dL/dθ` ，我们定义 `θ(t)` 表示 **`[t, t_1]` 区间的 `θ`** 。参考伴随状态，定义 \\( a_\theta(t) = \frac{\partial \mathbb{L}}{\partial \theta(t)} \\) 表示损失对 `θ(t)` 的梯度。显然，\\( \frac{d \mathbb{L}}{d \theta} = a_\theta(t_0) \\) , \\( a_\theta(t_1) = 0 \\) 。
+
+这样，与求解伴随状态类似，我们就可以得到：
+
+$$
+\begin{align*}
+a_\theta(t) &= \frac{\partial \mathbb{L}}{\partial \theta(t)} \\
+            &= \frac{\partial \mathbb{L}}{\partial z(t+dt)}\frac{\partial z(t+dt)}{\partial \theta(t)} + \frac{\partial \mathbb{L}}{\partial \theta(t+dt)}\frac{\partial \theta(t+dt)}{\partial \theta(t)} \\
+            &= a(t+dt)\frac{\partial z(t+dt)}{\partial \theta(t)} + a_\theta(t+dt) \\
+            &= a(t+dt)\frac{\partial (z(t)+fdt+o(dt))}{\partial \theta(t)} + a_\theta(t+dt) \\
+            &= a(t+dt)\frac{\partial f}{\partial \theta}dt + o(dt) + a_\theta(t+dt)  \tag{9}
+\end{align*}
+$$
+
+其中，\\( \frac{\partial z(t)}{\partial \theta(t)} = 0 \\) ，因为 `z(t)` 是 `t` 时刻的网络输入，与 `[t, t_1]` 区间的网络参数 `θ(t)` 无关。
+
+接下来计算 `a_θ(t)` 的梯度：
+
+$$
+\begin{align*}
+\frac{da_\theta(t)}{dt} &= \lim_{dt \to 0} \frac{a_\theta(t+dt) - a_\theta(t)}{dt} \\
+                 &= \lim_{dt \to 0} \frac{-a(t+dt) \frac{\partial f}{\partial \theta}dt - o(dt)}{dt} \\
+                 &= -a(t) \frac{\partial f}{\partial \theta} \tag{10}
+\end{align*}
+$$
+
+最后，通过 ODE-Solver 求解 `dL/dθ` ：
+- 微分方程右侧函数：由公式（11）给出，其中 `a(t)` 在之前已经给出。
+- 初值 `a_θ(t_1) = 0`
+- 起止时间 `t_1, t_0`
+
+### 完整算法
+
+由于 `dL/dθ` 的求解过程依赖 `a(t)` 、 `z(t)` ，我们可以使用一个 ODE-Solver 对它们同时求解。
+
+- 微分方程右侧函数：\\( \left[f(z(t),t,\theta), -a(t)\frac{\partial f}{\partial z(t)}, -a(t)\frac{\partial f}{\partial \theta(t)}\right] \\)
+- 初值 \\( \left[z(t_1), \frac{\partial \mathbb{L}}{\partial z(t_1)}, 0\right] \\)
+- 起止时间 `t_1, t_0 `
